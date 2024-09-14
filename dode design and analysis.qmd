@@ -66,7 +66,7 @@ scale_to_sum_to_max_one <- function(x) {
 #   the existing columns
 process_coded_scaling <- function(data, subfactor_cols, scaled_col_prefix = "x") {
   unscaled_set <- data[, subfactor_cols]
-  message("dim:", paste(dim(unscaled_set), collapse = "_"))###
+  message("dim:", paste(dim(unscaled_set), collapse = "_"))### REMOVE WHEN DONE
   scaled_set <- matrix(nrow = nrow(unscaled_set), ncol = ncol(unscaled_set))
   
   for (i in 1:nrow(scaled_set)) {
@@ -199,9 +199,8 @@ calc_dynamic_fctr_tgt <-
 # inputs: 
 # - coded_seq_len : # distinct values to generate for each design factor;
 #     used in seq(-1, 1, length.out = coded_seq_len) (e.g. 3 creates (-1, 0, 1))
-
 # note: currently the function only supports continuous factors;
-#   to build a design with categorical factors, build a design with
+#   to build a balanced design with categorical factors, build a design with
 #   (# runs) / (# categorical factor levels) runs and repeat the design runs
 #   for each categorical factor level
 # - factor_list : list with named entries 'dynamic' and 'static'.
@@ -210,10 +209,14 @@ calc_dynamic_fctr_tgt <-
 #     (1 = intercept, 2 = intercept + slope...)
 #     and the 'static' entry is a single integer listing the number of 
 #     time-static factors
+#     NOTE: factor values -must- be listed on the coded scale
 # - factor_lims : list with named entries 'dynamic' and 'static',
 #     where the 'dynamic' and 'static' lists each contain a list with each entry 
 #     corresponding to the same-ordered entry in 'factor_list'
 #     each named entry contains a two-number vector (first: lower limit, second: upper limit)
+#     NOTE: limit values -must- be listed on the nominal scale
+# - rplct_list : list of design runs which must be repeated
+# - rng_seed : RNG seed number for replicability of the selected design
 
 coded_seq_len <- 5
 fctr_list <- list("dynamic" = c(3, 2), "static" = 2)
@@ -224,6 +227,15 @@ rplct_list <- list(rep(0, sum(c(fctr_list$dynamic, fctr_list$static))))
 ### NOTE: NON-NULL REPLICATE LIST MUST HAVE LENGTH MATCHING COMBINED LENGTH OF NAMES IN FCTR_LIMS
 ###
 
+### NEED TO INCLUDE IN THE FUNCTION INPUTS SET
+rng_seed <- 42
+n_runs <- 20
+optimality <- c("A", "I", "D")[2]
+design_iter <- 100
+design_repeat <- 25
+###
+### work in progress code here
+###
 
 ### LOOPED PROCESS TO BUILD DYNAMIC SUBFACTORS
 dynamic_subfactors <- 
@@ -244,74 +256,93 @@ static_factors <-
 names(static_factors) <- names(fctr_lims$static)
 
 all_candidates <- expand.grid(c(dynamic_subfactors, static_factors))
-
+x <- all_candidates
 # process time-dynamic subfactors to necessary scaling
-    # note: this step can take a bit of time...
-    for (i in 1:length(fctr_lims$dynamic)) {
-      all_candidates <- 
-        process_coded_scaling(all_candidates, 
-                              paste0(names(fctr_lims$dynamic)[i], 
-                                     "_x", 
-                                     c(1:fctr_list$dynamic[i])),
-                              paste0(names(fctr_lims$dynamic)[i], "_x") )
+# note: this step can take a bit of time...
+for (i in 1:length(fctr_lims$dynamic)) {
+  all_candidates <- 
+    process_coded_scaling(all_candidates, 
+                          paste0(names(fctr_lims$dynamic)[i], 
+                                 "_x", 
+                                 c(1:fctr_list$dynamic[i])),
+                          paste0(names(fctr_lims$dynamic)[i], "_x") )
 }
 
 if (!is.null(rplct_list)) { # append replicate runs to candidate runs
   fctr_ord <- colnames(all_candidates)[!grepl("_scaled$", colnames(all_candidates))]
-    if (is.null(rplct_list)) {
-      rep_vec <- rep(0, length(fctr_ord))
-      rplct_df <- as.data.frame(t(rep_vec))
-    } else {
-      # ensure specified replicates are necessary length
-      rplct_dsgn_ok <- vapply(1:length(rplct_list), function(i) {
-        length(rplct_list[[i]]) == length(fctr_ord)
-      }, logical(1L))
+  # ensure specified replicates are necessary length
+  rplct_dsgn_ok <- vapply(1:length(rplct_list), function(i) {
+    length(rplct_list[[i]]) == length(fctr_ord)
+    }, logical(1L))
       
-      if (all(rplct_dsgn_ok)) {
-        rplct_df <- do.call(rbind, rplct_list)
-        rplct_df <- as.data.frame(rplct_df)
-        colnames(rplct_df) <- fctr_ord
+  if (all(rplct_dsgn_ok)) {
+    rplct_df <- do.call(rbind, rplct_list)
+    rplct_df <- as.data.frame(rplct_df)
+    colnames(rplct_df) <- fctr_ord
         
-        for (i in 1:length(fctr_lims$dynamic)) {
+    for (i in 1:length(fctr_lims$dynamic)) {
       rplct_df <- 
         process_coded_scaling(rplct_df, 
                               paste0(names(fctr_lims$dynamic)[i], 
                                      "_x", 
                                      c(1:fctr_list$dynamic[i])),
                               paste0(names(fctr_lims$dynamic)[i], "_x") )
-}
-        
-      } else {
+      }
+    } else {
         stop(paste("One or more replicate_list entries do not align with end design; entry order should be:", paste(fctr_ord, collapse = ", "), "(dynamic subfactor(s), then static factor(s))"))
         }
-    }
     colnames(rplct_df) <- colnames(all_candidates)
     # drop replicate runs from non-replicate df
     rep_match_idx <- 
       duplicated(rbind(rplct_df, all_candidates))[-seq_len(nrow(rplct_df))]
     all_candidates <- all_candidates[!rep_match_idx,]
-}
+  } else {
+  rplct_df <- NULL
+  }
+
+rplct_idx <- if (!is.null(rplct_df)) {1:nrow(rplct_df) + nrow(all_candidates)}
+
+all_candidates <- rbind(all_candidates, rplct_df)
 
 ###
 ### RESUME HERE
 ###
 
+length(fctr_list$dynamic)
+
+fctrs <- colnames(all_candidates)[-c(1:sum(fctr_list$dynamic))]
+
+# generate optimized design from cadndidate points
+  # full model design: main effects, two-factor interactions ('(.)^2')
+  #   and quadratic effects ('I(x)^2')
+  frml <- 
+    paste0(
+      "~ (.)^2 + ", paste(paste0("I(", fctrs, "^2)"), collapse = " + ")
+    )
+
+# optimal design
+if (!is.null(rng_seed)) {set.seed(rng_seed)}
+  optim_dsgn <- 
+    AlgDesign::optFederov(
+      frml = as.formula(frml),
+      data = fctrs,
+      nTrials = n_runs,
+      eval = TRUE,
+      approximate = FALSE,
+      criterion = optimality,
+      rows = rplct_idx,
+      augment = !is.null(rplct_idx), # exact design unless replicates are included
+      maxIteration = design_iter,
+      nRepeats = design_repeat
+    )
+
+### 'objet 's1' not found error...NEED TO TROUBLESHOOT
 
 
 
 
 
 
-
-
-
-
-
-
-fctr_seq <- unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
-  fctr_lst <- lapply(1:n_components, function(x) {fctr_seq})
-  names(fctr_lst) <- paste0("x", 1:n_components)
-  fctrs <- expand.grid(fctr_lst)
 
 # - n_runs : number of experimental runs in the design
 # - run_length : number of time units (e.g. days) per experimental run
