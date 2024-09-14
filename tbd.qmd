@@ -1,0 +1,1854 @@
+---
+title: "DoDE Analysis - Functions and Workflow"
+author: "Duane Stanton"
+format: html
+editor: source
+---
+
+```{r}
+pkgs <- c("dplyr", "tidyr", "ggplot2", "lme4", "AlgDesign", "glmnet")
+for (i in seq_along(pkgs)) {library(pkgs[i], character.only = TRUE)}
+```
+
+
+# Experimental Design Functions (incl. helper functions)
+
+```{r dsgn-helper-fxns}
+#| echo: true
+
+# simple version of the rounding function
+# inputs:
+# - x : numeric vector
+# - dec : number of decimals; single number that will be coerced to integer
+# - trailing_0: TRUE/FALSE whether to keep trailing 0s (e.g. 1.10 vs. 1.1)
+#               note: if TRUE, result will be a character, not numeric, vector
+# output:
+# - numeric (trailing_0 = FALSE) or character (trailing_0 = TRUE) vector
+round_ <- function(x, dec, trailing_0 = TRUE) {
+  # prelim checks
+  stopifnot("'x' must be numeric" = is.numeric(x),
+            "'dec' must be a single number (coerced to integer)" = length(dec) == 1L & is.numeric(dec),
+            "'trailing_0' must be TRUE or FALSE" = length(trailing_0) == 1L & is.logical(trailing_0))
+  dec <- as.integer(dec)
+  
+  x_ <- x
+  x <- x[!is.na(x)]
+  
+  x_rnd <- 
+    (trunc((abs(x) * 10^dec) + 0.5 + sqrt(.Machine$double.eps)) / 10^dec) * sign(x)
+  
+  if (trailing_0) {x_rnd <- sprintf(fmt = paste0("%.", dec, "f"), x_rnd)}
+  
+  x_[!is.na(x_)] <- x_rnd
+  x_
+}
+
+# function to ensure time-dynamic sub factors abs val sum to 1 at most
+# input: 
+# - x : numeric vector
+# output:
+# - numeric vector whose sum of absolute values is at most one
+#   note: if the original vector would have 'absolute sum < 1', the original vector is returned
+scale_to_sum_to_max_one <- function(x) {
+  if (all(x == 0) | sum(abs(x)) <= 1) {as.numeric(x)
+  } else {as.numeric(x / sum(abs(x)))}
+}
+
+# function to apply scale_to_sim_to_max_one to initial design dataset
+# note: process one set of time-dynamic factors (tied to a single time-dynamic 
+#       factor) per function call
+# inputs:
+# - data : the original design data.frame
+# - subfactor_cols : character vector of the colnames in 'data' for time-dynamic subfactors
+# - scaled_col_prefix : character string for front of scaled-result column names
+# output:
+# - 'data' with scaled time-dynamic subfactor columns added to to the end of 
+#   the existing columns
+process_coded_scaling <- function(data, subfactor_cols, scaled_col_prefix = "x") {
+  unscaled_set <- data[, subfactor_cols]
+  message("dim:", paste(dim(unscaled_set), collapse = "_"))###
+  scaled_set <- matrix(nrow = nrow(unscaled_set), ncol = ncol(unscaled_set))
+  
+  for (i in 1:nrow(scaled_set)) {
+    scaled_set[i,] <- scale_to_sum_to_max_one(unscaled_set[i,])
+  }
+  for (j in 1:ncol(scaled_set)) {
+    data[[paste0(scaled_col_prefix, j, "_scaled")]] <- scaled_set[, j]
+  }
+  
+  data
+}
+
+# function to calculate time-dynamic subfactor from coded 'structural' scale
+# note: process one set of time-dynamic factors (tied to a single time-dynamic 
+#       factor) per function call
+#   to 'nominal/real-world at a point in time' scale (shifted Legendre polynomials)
+# inputs:
+# - ctr_val : nominal-scale value corresponding to coded-scale '0'
+# - incrmt : nominal-scale value corresponding to steps change between coded '0' and '+1'
+# - tau: proportion of runtime desired to calculate (0 = start, 1 = end)
+# - subfactors: vector of coded-scale time-dynamic subfactor values
+#               note: -must- be in increasing-complexity order (x1, x2, x3, ...)
+# output:
+# - nominal value of time-dynamic subfactor at designated proportion of runtime
+#   given the time-dynamic subfactor component values
+# note: currently up to 5 time-dynamic subfactors are supported (degree-5 polynomial)
+#       for additional entries, use formula subfactors[n] * FORMULA
+#       FORMULA: (1 / n!) * (d^n / dx^n)[(tau^2 - tau)^n]
+#       (d^n / dx^n) is the nth-root derivative of the expanded polynomial
+t_tau_fxn <- function(ctr_val, incrmt, tau, subfactors) {
+  n_subfctr <- length(subfactors)
+  
+  ctr_val + incrmt * {
+    subfactors[1] * 1 +
+      {if (n_subfctr > 1) {
+        subfactors[2] * (-1 + 2 * tau)} else {0}} +
+      {if (n_subfctr > 2) {
+        subfactors[3] * (1 - 6 * tau + 6 * tau^2)} else {0}} +
+      {if (n_subfctr > 3) {
+        subfactors[4] * (-1 + 12 * tau - 30 * tau^2 + 20 * tau^3)} else {0}} +
+      {if (n_subfctr > 4) {
+        subfactors[5] * (1 - 20 * tau + 90 * tau^2 - 140 * tau^3 + 70 * tau^4)
+        } else {0}}
+  }
+}
+
+# function to calculate nominal time-dynamic factor target for each distinct time point
+# note: can support as many time-dynamic subfactors as t_tau_fxn support (as it uses this)
+# note: process one set of time-dynamic factors (tied to a single time-dynamic 
+#       factor) per function call
+# inputs:
+# - data : data.frame of experimental design; each row must be a distinct
+#          experimental run
+# - coded_fctr_cols : a character vector of names coded-scale time-dynamic
+#                     subfactor cols in 'data'; must be scaled so rowwise sum
+#                     across cols is within [0, 1]
+# - num_timepts : number of distinct time points to calculate target nominal
+#                 values for
+# - update_freq : frequency with which time-dynamic factor is updated
+#                 (1 = each time point, 2 = every other time point, ...)
+# - nominal_ctr : nominal-scale value coding to '0' for the time-dynamic factor
+# - nominal_incr : nominal-scale value coding to 1-unit increase for the time-dynamic factor
+# - time_term : string for labeling time unit of created time-dynamic cols
+# - fctr_term : string for labeling time-dynamic factor of created time-dynamic cols
+# output:
+# - 'data' with nominal-scale target values (1 col per time point) for the time-dynamic factor
+calc_dynamic_fctr_tgt <- 
+  function(data, coded_fctr_cols, num_timepts, update_freq, nominal_ctr, nominal_incr,
+           fctr_term = "fctr", time_term = "day") {
+    timepts <- c(0:num_timepts)
+    timepts_a <- timepts[timepts %% update_freq == 0] # points to calculate
+    # note: timepts_a current 'assign from start' of time span;
+    #       to 'assign from end' of time span -> can recode with aid of time_mat_mat (below)
+    run_propn <- timepts_a / num_timepts
+    timepts_a_idx <- which(timepts %in% timepts_a)
+    
+    timepts_b <- timepts[timepts %% update_freq != 0] # non-calculated time points
+    timepts_b_idx <- which(timepts %in% timepts_b)
+    
+    if (update_freq > 1) {
+      time_map_mat <- # mapping 'other' points to correct 'calculated' points
+        matrix(c(time_pts_b, rep(0, 2 * length(timepts_b))),
+               nrow = length(timepts_b), byrow = FALSE,
+               dimnames = list(NULL, c("time_b", "time_a_map", "time_a_idx")))
+      time_map_mat[, 2] <- # timept_a from which given timept_b inherits nominal value
+        vapply(1:length(timepts_b), function(i) {
+          timepts_a[sum(timepts_a < timepts_b[i])]}, integer(1L))
+      time_map_mat[, 3] <- # timept_a_idx aligns to 'mapped' timept_a
+        vapply(1:length(timepts_b), function(i) {
+          timepts_a_idx[timepts_a == time_map_mat[i, 2]]}, integer(1L))
+    }
+    
+    nm_nom <- paste0(fctr_term, "_", time_term, "_", timepts)
+    
+    for (i in 1:length(timepts_a)) { # calculate nominal value at 'timept_a' points
+      for (j in 1:nrow(data)) {
+        data[[nm_nom[timepts_a_idx[i]]]][j] <- 
+          t_tau_fxn(
+            ctr_val = nominal_ctr, incrmt = nominal_incr, tau = run_propn[i],
+            subfactors = as.numeric(data[j, coded_fctr_cols])
+          )
+      }
+    }
+    
+    if (update_freq > 1) {
+      for (i in 1:length(timepts_b)) { # assign correct nominal val per 'timept_b' point
+        for (j in 1:nrow(data)) {
+          data[[nm_nom[timepts_b_idx[i]]]][j] <- data[[nm_nom[time_map_mat[i, 3]]]][j] 
+        }
+      }
+      # reorder 'nm_nom' cols to desired order
+      reord_cols_idx <- (1:ncol(data))[which(colnames(data) %in% nm_nom)]
+      other_cols <- (1:ncol(data))[which(!(colnames(data) %in% nm_nom))]
+      reord_cols_idx2 <- reord_cols_idx[order(c(timepts_a_idx, timepts_b_idx))]
+      
+      x <- data[, other_cols]
+      for (i in 1:length(reord_cols_idx)) {
+        x[, reord_cols_idx[i]] <- data[, reord_cols_idx2[i]]
+      }
+      colnames(x)[reord_cols_idx] <- colnames(data)[reord_cols_idx2]
+      x
+    } else {data}
+  }
+```
+
+
+```{r dode-design-fxn-new}
+# allow for additional time-dynamic and -static factors
+
+# inputs: 
+# - coded_seq_len : # distinct values to generate for each design factor;
+#     used in seq(-1, 1, length.out = coded_seq_len) (e.g. 3 creates (-1, 0, 1))
+
+# note: currently the function only supports continuous factors;
+#   to build a design with categorical factors, build a design with
+#   (# runs) / (# categorical factor levels) runs and repeat the design runs
+#   for each categorical factor level
+# - factor_list : list with named entries 'dynamic' and 'static'.
+#     where the 'dynamic' entry is a numeric vector with each entry listing
+#     the number of degrees the polynomial factor has 
+#     (1 = intercept, 2 = intercept + slope...)
+#     and the 'static' entry is a single integer listing the number of 
+#     time-static factors
+# - factor_lims : list with named entries 'dynamic' and 'static',
+#     where the 'dynamic' and 'static' lists each contain a list with each entry 
+#     corresponding to the same-ordered entry in 'factor_list'
+#     each named entry contains a two-number vector (first: lower limit, second: upper limit)
+
+coded_seq_len <- 5
+fctr_list <- list("dynamic" = c(3, 2), "static" = 2)
+fctr_lims <- list("dynamic" = list("d1" = c(0, 100), "d2" = c(20, 40)),
+                  "static" = list("s1" = c(5, 10), "s2" = c(1, 3)))
+rplct_list <- list(rep(0, sum(c(fctr_list$dynamic, fctr_list$static))))
+###
+### NOTE: NON-NULL REPLICATE LIST MUST HAVE LENGTH MATCHING COMBINED LENGTH OF NAMES IN FCTR_LIMS
+###
+
+
+### LOOPED PROCESS TO BUILD DYNAMIC SUBFACTORS
+dynamic_subfactors <- 
+  lapply(seq_along(fctr_list$dynamic), function(i) {
+    fctr_seq <- unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
+    fctr_lst <- lapply(1:fctr_list$dynamic[i], function(x) {fctr_seq})
+    names(fctr_lst) <- paste0(names(fctr_lims$dynamic)[i], "_x", 1:fctr_list$dynamic[i])
+    fctr_lst
+  })
+
+dynamic_subfactors <- unlist(dynamic_subfactors, recursive = FALSE)
+
+static_factors <- 
+  lapply(1:fctr_list$static, function(i) {
+    unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
+  })
+
+names(static_factors) <- names(fctr_lims$static)
+
+all_candidates <- expand.grid(c(dynamic_subfactors, static_factors))
+
+# process time-dynamic subfactors to necessary scaling
+    # note: this step can take a bit of time...
+    for (i in 1:length(fctr_lims$dynamic)) {
+      all_candidates <- 
+        process_coded_scaling(all_candidates, 
+                              paste0(names(fctr_lims$dynamic)[i], 
+                                     "_x", 
+                                     c(1:fctr_list$dynamic[i])),
+                              paste0(names(fctr_lims$dynamic)[i], "_x") )
+}
+
+if (!is.null(rplct_list)) { # append replicate runs to candidate runs
+  fctr_ord <- colnames(all_candidates)[!grepl("_scaled$", colnames(all_candidates))]
+    if (is.null(rplct_list)) {
+      rep_vec <- rep(0, length(fctr_ord))
+      rplct_df <- as.data.frame(t(rep_vec))
+    } else {
+      # ensure specified replicates are necessary length
+      rplct_dsgn_ok <- vapply(1:length(rplct_list), function(i) {
+        length(rplct_list[[i]]) == length(fctr_ord)
+      }, logical(1L))
+      
+      if (all(rplct_dsgn_ok)) {
+        rplct_df <- do.call(rbind, rplct_list)
+        rplct_df <- as.data.frame(rplct_df)
+        colnames(rplct_df) <- fctr_ord
+        
+        for (i in 1:length(fctr_lims$dynamic)) {
+      rplct_df <- 
+        process_coded_scaling(rplct_df, 
+                              paste0(names(fctr_lims$dynamic)[i], 
+                                     "_x", 
+                                     c(1:fctr_list$dynamic[i])),
+                              paste0(names(fctr_lims$dynamic)[i], "_x") )
+}
+        
+      } else {
+        stop(paste("One or more replicate_list entries do not align with end design; entry order should be:", paste(fctr_ord, collapse = ", "), "(dynamic subfactor(s), then static factor(s))"))
+        }
+    }
+    colnames(rplct_df) <- colnames(all_candidates)
+    # drop replicate runs from non-replicate df
+    rep_match_idx <- 
+      duplicated(rbind(rplct_df, all_candidates))[-seq_len(nrow(rplct_df))]
+    all_candidates <- all_candidates[!rep_match_idx,]
+}
+
+###
+### RESUME HERE
+###
+
+
+
+
+
+
+
+
+
+
+
+
+
+fctr_seq <- unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
+  fctr_lst <- lapply(1:n_components, function(x) {fctr_seq})
+  names(fctr_lst) <- paste0("x", 1:n_components)
+  fctrs <- expand.grid(fctr_lst)
+
+# - n_runs : number of experimental runs in the design
+# - run_length : number of time units (e.g. days) per experimental run
+# - run_incrmt : increment of time units over which time-dynamic factor can change
+#     (e.g. 1 for a per-time-unit update over the run)
+# - n_rplcts : number of replicates to assign; there will be (n_runs - n_rplcts)
+#     runs available for optimality-assigned runs
+# - rplct_vec : a vector with 'n_components' entries defining the replicate run;
+#     currently only 1 replicate vector is supported
+#           note: if desiring multiple vectors, may be possible to refactor the 
+#           function taking this as a list of vectors and revising downstream accordingly
+#     TODO: look into extending functionality accordingly (would need addl arg vector specifying replication quantity, and probably a control check to ensure replicates < total runs)
+# - optimality : optimality criterion for AlgDesign::optFedorov ("A", "D", or "I")
+# - factor_name : string descriptor for the time-dynamic factor
+# - time_name : string descriptor for the time unit of the experimental run
+# - rng_seed : seed for the optimality selection to allow replicability
+# - rplt_shuffle_seed : seed to reshuffle the design when replicates are added
+#     to allow replicability; shuffling is needed else 
+#     replicates are always last
+# - coded_seq_len : length of the coded sequence (seq(-1, 1, length.out = _))
+#     used to design candidate experimental runs - a greater sequence length
+#     generates more potential combinations of variable values for the 
+#     AlgDesign::optFedorov point-exchange design - a better chance of improving
+#     the final design's optimality, at the expense of a longer runtime
+# - banned_runs : if not NULL, a list of specific experimental run set(s)
+#     that should -not- be permitted in the optimal design; use this to rule out 
+#     specific sets on the CODED scale
+# - factor_low, factor_high : the nominal-scale lower/upper limits of the
+#     time-dynamic factor
+# - design_iter : maximum number of times candidate design runs can be exchanged
+#     for a given 'n_runs' slot when choosing an optimal design (more = slower)
+# - design_repeat : number of times the optimal design-selection process is run
+#     before settling on a final design (more = slower)
+# outputs:
+# - criterion_scores : vector with optimality criteria scores
+#     'D' det(M)^(1/k)), where det(M) is the determinant of the normalized 
+#        var-covar matrix; lower = lower overall variance of model reg coeffs
+#     'A' trace(Mi) / k, average coefficient variance
+#     'I' trace((X'X * Mi) / N); average prediction variance over design space
+# - design : data.frame with the coded-scale time-dynamic subfactors plus
+#     per-time point nominal scale settings for the time-dynamic factor
+make_optimal_dode <- function(
+    n_components = 2, n_runs, run_length, run_incrmt, n_rplcts = 0, 
+    rplct_vec = NULL, optimality = "I", factor_name, time_name, rng_seed = NULL, 
+    rplct_shuffle_seed = NULL, coded_seq_len = 5, banned_runs = NULL,
+    factor_low, factor_high, design_iter = 100, design_repeat = 5){
+  library(AlgDesign) ; library(dplyr)
+  
+  stopifnot(
+    "'n_components' must be an integer between 2 and 5" = n_components %in% c(2:5),
+    "'n_rplcts' should be less than 'n_runs'" = n_rplcts < n_runs,
+    "'n_rplcts' is 0 while 'rplct_vec' is non-NULL" = 
+      !(n_rplcts == 0 & !is.null(rplct_vec)),
+    "'rplct_vec' must have 'n_components' entries" = 
+      !(length(rplct_vec) != n_components & !is.null(rplct_vec)),
+    "'factor_low' must be less than 'factor_high'" = factor_low < factor_high,
+    "'optimality' must be one of 'A', 'D', 'I'" = 
+      length(optimality) == 1L & optimality %in% c("A", "D", "I"),
+    "'banned_runs' must be a list of vectors if not NULL" = 
+      is.null(banned_runs) | is.list(banned_runs),
+    "each entry in 'banned_runs' must be a vector with length 'n_components'" = 
+      is.null(banned_runs) | all(vapply(banned_runs, length, integer(1L)) == n_components)
+    )
+  
+  fctr_seq <- unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
+  fctr_lst <- lapply(1:n_components, function(x) {fctr_seq})
+  names(fctr_lst) <- paste0("x", 1:n_components)
+  fctrs <- expand.grid(fctr_lst)
+  
+  if (n_rplcts > 0) { # append replicate runs to candidate runs
+    if (is.null(rplct_vec)) {rplct_vec <- rep(0, n_components)}
+    rplct_df <- 
+      matrix(rplct_vec, nrow = n_rplcts, ncol = n_components, byrow = TRUE) |> 
+      as.data.frame()
+    colnames(rplct_df) <- colnames(fctrs)
+    rplct_df <- 
+      process_coded_scaling(rplct_df, colnames(rplct_df)) |>
+      select(ends_with("_scaled"))
+  }
+
+  fctrs <- 
+    process_coded_scaling(fctrs, colnames(fctrs)) |> 
+    distinct() |> 
+    select(ends_with("_scaled"))
+  
+  if (!is.null(banned_runs)) {
+    design_vecs <- lapply(1:nrow(fctrs), function(i) {as.numeric(fctrs[i,])})
+    banned_flag <- lapply(seq_along(nruns), function(i) {
+      vapply(seq_along(design_vecs), function(j) {
+        all.equal(banned_runs[[i]], design_vecs[[j]]) == TRUE }, logical(1L))
+    })
+    banned_tracker <- matrix(nrow = nrow(fctrs), ncol = length(banned_flag))
+    for (i in 1:length(banned_flag)) {banned_tracker[, i] <- banned_flag[[i]]}
+    fctrs <- fctrs[!apply(banned_tracker, 1, any)]
+  }
+  
+  if (n_rplcts > 0) {
+    fctrs <- rbind(fctrs, rplct_df)
+    rplct_idx <- (nrow(fctrs) - n_rplcts + 1):nrow(fctrs)
+  } else {rplct_idx <- NULL}
+  
+  # generate optimized design from cadndidate points
+  # full model design: main effects, two-factor interactions ('(.)^2')
+  #   and quadratic effects ('I(x)^2')
+  frml <- 
+    paste0(
+      "~ (.)^2 + ", paste(paste0("I(", colnames(fctrs), "^2)"), collapse = " + ")
+    )
+
+  if (!is.null(rng_seed)) {set.seed(rng_seed)}
+  optim_dsgn <- 
+    AlgDesign::optFederov(
+      frml = as.formula(frml),
+      data = fctrs,
+      nTrials = n_runs,
+      eval = TRUE,
+      approximate = FALSE,
+      criterion = optimality,
+      rows = rplct_idx,
+      augment = n_rplcts > 0, # exact design unless replicates are included
+      maxIteration = design_iter,
+      nRepeats = design_repeat
+    )
+  
+  criterion_scores = c("A" = optim_dsgn$A, "D" = optim_dsgn$D, "I" = optim_dsgn$I)
+  
+  if (n_rplcts > 0) {
+    if (!is.null(rplct_shuffle_seed)) {set.seed(rplct_shuffle_seed)}
+  optim_dsgn$design <- optim_dsgn$design[sample(1:n_runs, n_runs, replace = FALSE),]
+  }
+  
+  # generate target per-time point factor settings - final output
+  design <- 
+    calc_dynamic_fctr_tgt(
+      data = optim_dsgn$design,
+      coded_fctr_cols = colnames(optim_dsgn$design),
+      num_timepts = run_length,
+      update_freq = run_incrmt,
+      nominal_ctr = (factor_high + factor_low) * 0.5,
+      nominal_incr = (factor_high - factor_low) * 0.5,
+      fctr_term = factor_name,
+      time_term = time_name
+    )
+  design <-
+    design |> 
+    mutate(Run = 1:nrow(design)) |> 
+    select(Run, everything())
+
+  list("criterion_scores" = criterion_scores, "design" = design)
+}
+```
+
+
+```{r dode-design-fxn}
+#| echo: true
+
+# function to build time-dynamic factorial experiment design
+# note: requires the 'helper functions' defined above 
+#   (currently supports up to 5-degree polynomial trajectory)
+# note: currently supports a single time-dynamic factor only
+# TODO: extend to support combinations of time-dynamic and -static factors
+# inputs: 
+# - n_components : number of time-dynamic subfactor components defining the
+#     time-dynamic factor's trajectory (2 = slope-intercept, 3 = quadratic, ...)
+#           note: 2 is the minimum required
+# - n_runs : number of experimental runs in the design
+# - run_length : number of time units (e.g. days) per experimental run
+# - run_incrmt : increment of time units over which time-dynamic factor can change
+#     (e.g. 1 for a per-time-unit update over the run)
+# - n_rplcts : number of replicates to assign; there will be (n_runs - n_rplcts)
+#     runs available for optimality-assigned runs
+# - rplct_vec : a vector with 'n_components' entries defining the replicate run;
+#     currently only 1 replicate vector is supported
+#           note: if desiring multiple vectors, may be possible to refactor the 
+#           function taking this as a list of vectors and revising downstream accordingly
+#     TODO: look into extending functionality accordingly (would need addl arg vector specifying replication quantity, and probably a control check to ensure replicates < total runs)
+# - optimality : optimality criterion for AlgDesign::optFedorov ("A", "D", or "I")
+# - factor_name : string descriptor for the time-dynamic factor
+# - time_name : string descriptor for the time unit of the experimental run
+# - rng_seed : seed for the optimality selection to allow replicability
+# - rplt_shuffle_seed : seed to reshuffle the design when replicates are added
+#     to allow replicability; shuffling is needed else 
+#     replicates are always last
+# - coded_seq_len : length of the coded sequence (seq(-1, 1, length.out = _))
+#     used to design candidate experimental runs
+# - banned_runs : if not NULL, a list of specific experimental run set(s)
+#     that should -not- be permitted in the optimal design; use this to rule out 
+#     specific sets on the CODED scale
+# - factor_low, factor_high : the nominal-scale lower/upper limits of the
+#     time-dynamic factor
+# - design_iter : maximum number of times candidate design runs can be exchanged
+#     for a given 'n_runs' slot when choosing an optimal design (more = slower)
+# - design_repeat : number of times the optimal design-selection process is run
+#     before settling on a final design (more = slower)
+# outputs:
+# - criterion_scores : vector with optimality criteria scores
+#     'D' det(M)^(1/k)), where det(M) is the determinant of the normalized 
+#        var-covar matrix; lower = lower overall variance of model reg coeffs
+#     'A' trace(Mi) / k, average coefficient variance
+#     'I' trace((X'X * Mi) / N); average prediction variance over design space
+# - design : data.frame with the coded-scale time-dynamic subfactors plus
+#     per-time point nominal scale settings for the time-dynamic factor
+make_optimal_dode <- function(
+    n_components = 2, n_runs, run_length, run_incrmt, n_rplcts = 0, 
+    rplct_vec = NULL, optimality = "I", factor_name, time_name, rng_seed = NULL, 
+    rplct_shuffle_seed = NULL, coded_seq_len = 5, banned_runs = NULL,
+    factor_low, factor_high, design_iter = 100, design_repeat = 5){
+  library(AlgDesign) ; library(dplyr)
+  
+  stopifnot(
+    "'n_components' must be an integer between 2 and 5" = n_components %in% c(2:5),
+    "'n_rplcts' should be less than 'n_runs'" = n_rplcts < n_runs,
+    "'n_rplcts' is 0 while 'rplct_vec' is non-NULL" = 
+      !(n_rplcts == 0 & !is.null(rplct_vec)),
+    "'rplct_vec' must have 'n_components' entries" = 
+      !(length(rplct_vec) != n_components & !is.null(rplct_vec)),
+    "'factor_low' must be less than 'factor_high'" = factor_low < factor_high,
+    "'optimality' must be one of 'A', 'D', 'I'" = 
+      length(optimality) == 1L & optimality %in% c("A", "D", "I"),
+    "'banned_runs' must be a list of vectors if not NULL" = 
+      is.null(banned_runs) | is.list(banned_runs),
+    "each entry in 'banned_runs' must be a vector with length 'n_components'" = 
+      is.null(banned_runs) | all(vapply(banned_runs, length, integer(1L)) == n_components)
+    )
+  
+  fctr_seq <- unique(c(seq(-1, 1, length.out = coded_seq_len), 0))
+  fctr_lst <- lapply(1:n_components, function(x) {fctr_seq})
+  names(fctr_lst) <- paste0("x", 1:n_components)
+  fctrs <- expand.grid(fctr_lst)
+  
+  if (n_rplcts > 0) { # append replicate runs to candidate runs
+    if (is.null(rplct_vec)) {rplct_vec <- rep(0, n_components)}
+    rplct_df <- 
+      matrix(rplct_vec, nrow = n_rplcts, ncol = n_components, byrow = TRUE) |> 
+      as.data.frame()
+    colnames(rplct_df) <- colnames(fctrs)
+    rplct_df <- 
+      process_coded_scaling(rplct_df, colnames(rplct_df)) |>
+      select(ends_with("_scaled"))
+  }
+
+  fctrs <- 
+    process_coded_scaling(fctrs, colnames(fctrs)) |> 
+    distinct() |> 
+    select(ends_with("_scaled"))
+  
+  if (!is.null(banned_runs)) {
+    design_vecs <- lapply(1:nrow(fctrs), function(i) {as.numeric(fctrs[i,])})
+    banned_flag <- lapply(seq_along(nruns), function(i) {
+      vapply(seq_along(design_vecs), function(j) {
+        all.equal(banned_runs[[i]], design_vecs[[j]]) == TRUE }, logical(1L))
+    })
+    banned_tracker <- matrix(nrow = nrow(fctrs), ncol = length(banned_flag))
+    for (i in 1:length(banned_flag)) {banned_tracker[, i] <- banned_flag[[i]]}
+    fctrs <- fctrs[!apply(banned_tracker, 1, any)]
+  }
+  
+  if (n_rplcts > 0) {
+    fctrs <- rbind(fctrs, rplct_df)
+    rplct_idx <- (nrow(fctrs) - n_rplcts + 1):nrow(fctrs)
+  } else {rplct_idx <- NULL}
+  
+  # generate optimized design from cadndidate points
+  # full model design: main effects, two-factor interactions ('(.)^2')
+  #   and quadratic effects ('I(x)^2')
+  frml <- 
+    paste0(
+      "~ (.)^2 + ", paste(paste0("I(", colnames(fctrs), "^2)"), collapse = " + ")
+    )
+
+  if (!is.null(rng_seed)) {set.seed(rng_seed)}
+  optim_dsgn <- 
+    AlgDesign::optFederov(
+      frml = as.formula(frml),
+      data = fctrs,
+      nTrials = n_runs,
+      eval = TRUE,
+      approximate = FALSE,
+      criterion = optimality,
+      rows = rplct_idx,
+      augment = n_rplcts > 0, # exact design unless replicates are included
+      maxIteration = design_iter,
+      nRepeats = design_repeat
+    )
+  
+  criterion_scores = c("A" = optim_dsgn$A, "D" = optim_dsgn$D, "I" = optim_dsgn$I)
+  
+  if (n_rplcts > 0) {
+    if (!is.null(rplct_shuffle_seed)) {set.seed(rplct_shuffle_seed)}
+  optim_dsgn$design <- optim_dsgn$design[sample(1:n_runs, n_runs, replace = FALSE),]
+  }
+  
+  # generate target per-time point factor settings - final output
+  design <- 
+    calc_dynamic_fctr_tgt(
+      data = optim_dsgn$design,
+      coded_fctr_cols = colnames(optim_dsgn$design),
+      num_timepts = run_length,
+      update_freq = run_incrmt,
+      nominal_ctr = (factor_high + factor_low) * 0.5,
+      nominal_incr = (factor_high - factor_low) * 0.5,
+      fctr_term = factor_name,
+      time_term = time_name
+    )
+  design <-
+    design |> 
+    mutate(Run = 1:nrow(design)) |> 
+    select(Run, everything())
+
+  list("criterion_scores" = criterion_scores, "design" = design)
+}
+```
+
+```{r dode-viz-fxn}
+#| echo: true
+
+# function to visualize time-dynamic factor trajectory for experiment design
+# note: also need ad hoc code adjustment if including non-time dynamic factor(s)
+#   (e.g. change linetype/-width or point shape in aes() for levels of some other factor)
+# inputs:
+# - design_data : data.frame with run_var and dynam_vars as columns
+# - data_from_from_make_optimal_dode : TRUE/FALSE whether design_data is output
+#     from make_optimal_dode() ; the design has a 'standardized' output
+# - run_var : string of the run variable column design_data
+#     note: not required data_from_from_make_optimal_dode = TRUE
+# - dynam_var_pattern : string of time-dynamic per-day text pattern taken
+#     calc_dynamic_fctr_tgt() fctr_term and time_term
+#     e.g. "temp C_day" for time-dynamic temperature with fctr_term "temp C"
+#       and time_term "day"
+# - plot_title : string for resulting plot title
+# - color_vec : optional vector of color values to assign to individual lines in 
+#     the plot
+# output:
+# - plot with stepped lines for actual experimental runs and curved lines for
+#     ideal (constantly-updated) counterpart for time-dynamic factor
+visualize_dode <- 
+  function(design_data, data_from_from_make_optimal_dode = FALSE,
+           run_var, dynam_var_pattern, plot_title = NULL, color_vec = NULL) {
+    library(dplyr) ; library(tidyr) ; library(ggplot2)
+    
+    if (data_from_from_make_optimal_dode) {
+      dynam_var_pattern <- 
+        sub("(_[0-9]+)$", "", colnames(design_data)[ncol(design_data)])
+      run_var <- colnames(design_data)[1]
+    }
+    
+    dynam_vars <- grep(dynam_var_pattern, colnames(design_data), value = TRUE)
+    
+    if (!all(length(dynam_vars) > 0 &
+             c(run_var, dynam_vars) %in% colnames(design_data))) {
+      stop("Please ensure 'run_vars' and columns starting with 'dynam_var_pattern'
+           exist in 'design_data'")
+    }
+    
+    make_title_case <- function(x) {
+      words <- strsplit(x, split = " ")[[1]]
+      for (i in 1:length(words)) {
+        words[i] <- paste0(toupper(substr(words[i], 1, 1)),
+                           sub("^.{1}", "", words[i]))
+      }
+      paste(words, collapse = " ")
+    }
+    
+    fctr_nm <- sub("^(.*)_.*$", "\\1", dynam_var_pattern) |> make_title_case()
+    time_nm <- sub("^.*_(.*)$", "\\1", dynam_var_pattern) |> make_title_case()
+    
+    # account for potential replicate
+    plot_data <- 
+      design_data |> 
+      group_by(!!!syms(dynam_vars)) |> 
+      mutate(Run_ = paste(unique(!!sym(run_var)), collapse = ", "),
+             nRun = length(unique(!!sym(run_var))),
+             entry = row_number()) |> 
+      ungroup() |> 
+      filter(entry == 1L) |> 
+      select(-!!sym(run_var)) |> 
+      rename(Run = Run_) 
+    
+    plot_data <- 
+      plot_data |> 
+      mutate(Run = factor(Run, levels = plot_data$Run)) |> ### originally incl'd levels = .$Run
+      select(Run, all_of(dynam_vars)) |> 
+      pivot_longer(cols = all_of(dynam_vars),
+                   names_to = dynam_var_pattern,
+                   values_to = "dynam_value") |> 
+      mutate(
+        !!sym(dynam_var_pattern) :=
+          sub(paste0("^", dynam_var_pattern, "_([0-9]+)$"),
+              "\\1",
+              !!sym(dynam_var_pattern)) |> 
+          as.numeric()
+      )
+    
+    rpt_runs <- grep(",", plot_data$Run, value = TRUE) |> unique()
+    singles <- grep(",", plot_data$Run, value = TRUE, invert = TRUE) |> unique()
+    line_vec <- rep(c("dashed", "solid"), times = c(length(rpt_runs), length(singles)))
+    names(line_vec) <- c(rpt_runs, singles)
+    line_vec <- line_vec[levels(plot_data$Run)]
+    
+    min_time <- min(plot_data[[dynam_var_pattern]])
+    max_time <- max(plot_data[[dynam_var_pattern]])
+    
+    ggplot(data = plot_data,
+           aes(x = !!sym(dynam_var_pattern), y = dynam_value,
+               color = Run, linetype = Run)) +
+      geom_step() +
+      geom_line(linewidth = 0.7, alpha = 0.2) +
+      labs(title = plot_title, 
+           subtitle = "Steps: actual setting; Lines: idealized setting",
+           x = time_nm, 
+           y = fctr_nm) +
+      scale_x_continuous(breaks = min_time:max_time, minor_breaks = FALSE) +
+      {if (!is.null(color_vec)){scale_color_manual(values = unname(color_vec))}} + 
+      scale_linetype_manual(values = line_vec) +
+      guides(color = guide_legend(ncol = 2, order = 1),
+             linetype = guide_legend(ncol = 2, order = 1)) +
+      theme_bw()
+  }
+```
+
+# Experimental Analysis Functions (incl. helper functions)
+
+```{r eval-helper-fxns}
+#| echo: true
+
+# function to calculate PRESS and predicted R-squared
+calc_PRESS_pred_rsq <- function(lm) {
+  # predictive residuals
+  pred_res <- residuals(lm) / (1 - lm.influence(lm)$hat)
+  PRESS <- sum(pred_res^2)
+  # model sum of squares
+  tot_ss <- sum(anova(lm)$`Sum Sq`)
+  # predicted R-squared
+  pred_rsq <- 1 - PRESS / tot_ss
+  c("PRESS" = PRESS, "pred_rsq" = pred_rsq)
+}
+
+# function to apply LASSO regularization modeling for each response and fit 
+#   linear model accordingly
+# note: LASSO won't recognize model hierarchy - may need to manually update
+# inputs:
+# - data : 'wide' data.frame to be used for modeling; should have 1 col per response
+# - yvars : character vector of colnames for responses to model
+# - xvars : character vector of colnames for inputs to model
+# - code_suffix : string for suffix appended to coded-scale inputs 
+#     (should be present in 'data' colnames)
+# - only_coded : TRUE/FALSE whether to only evaluate coded-scale models
+#     note: if FALSE, nominal-scale inputs should have colnames that are
+#           same as paste0(xvars, code_suffix) (<- colnames for coded-scale inputs)
+# output:
+# - list of length length(yvars) with:
+# -- data : the modeled data.frame
+# -- resp : string of the modeled response colname
+# -- glmnet_cv : LASSO model object
+# -- tgt_lambda : tuning parameter lambda closest to 1 std err of minimum lambda
+#      with >0 model terms (NULL if no qualifying model)
+# -- tgt_gamma :
+# -- lambda_df :
+# -- lm_cd : coded-scale final lm object
+# -- glmnet_cv_coeffs : vector of nonzero coefficients from the glmnet_cv object
+# -- cd_coeffs : vector of coded-scale lm coefficients
+# -- uncd_coeffs : vector of nominal-scale lm coefficients
+# -- lm_summary_df : data.frame with summary details of coded/uncoded model terms
+#      and metrics (AdjR2, PRESS, PredR2)
+# -- resid_fit_df : residual-vs-fits data.frame for coded-scale lm data
+# -- resid_fit_plot : residual-vs-fits plot for coded-scale lm
+# -- qqnorm_plot : quantile-quantile normal plot for coded-scale lm
+eval_lin_mods <- 
+  function(data, yvars, xvars, run_var = "Run", code_suffix = "_cd", only_coded = FALSE) {
+    library(glmnet)
+    library(dplyr)
+    library(ggplot2)
+    
+    lapply(seq_along(yvars), function(i) {
+      code_x <- if (only_coded){xvars} else {paste0(xvars, code_suffix)}
+      
+      data_ <- 
+        data[, c(run_var, if (!only_coded){xvars}, code_x, yvars[i])] |> 
+        rename("value" = all_of(yvars[i]))
+      
+      xmat <- data_[, code_x] |> as.matrix()
+      yvec <- data_$value
+      
+      # leave-one-out cross-validation to evaluate LASSO regularization modeling
+      # note: used for model selection, not final modeling (lm handles that)
+      # from Elements of Statistical Learning, 2e (2017) by Hastie, Tibshirani,
+      # and Friedman p91:
+      # Regarding the coefficients themselves, the lasso shrinkage causes the 
+      # estimates of the non-zero coefficients to be biased towards zero, and in
+      # general they are not consistent. One approach for reducing this bias is
+      # to run the lasso to identify the set of non-zero coefficients, and then
+      # fit an un-restricted linear model to the selected set of features. This 
+      # is not always feasible, if the selected set is large.
+      #*note: 'the coefficients' are LASSO-fit estimates
+      #
+      # 'relaxed LASSO' (two-stage fitting: first to identify candidate terms,
+      # then refit candidate models in LASSO to refine a second penalty parameter 
+      # [gamma] - idea is the second fit will have less 'competition' of 'noise'
+      # variables for the optimization
+      glmnet_cv <- 
+        cv.glmnet(xmat, yvec, alpha = 1, intercept = TRUE, standardize = TRUE,
+                  relax = TRUE, nfolds = nrow(xmat), grouped = FALSE, 
+                  type.measure = "deviance") # MSE for Gaussian model
+      # selecting model with lambda.1se (within 1SE of min. regularization 
+      # [shrinkage] tuning param. lambda) as long as lambda.1se fit has >0 terms
+      # (if yes, flag to test intercept-only model here and use lambda closest
+      #  to lambda.1se [>lambda.min] with >0 terms; else flag the model)
+      # note: second tuning param. gamma will be selected at gamma.min
+      #  (gamma param. with min. cross-val error)
+      lambda_df <- 
+        data.frame(lambda = glmnet_cv$glmnet.fit$lambda,
+                   df = glmnet_cv$glmnet.fit$df) |> # number nonzero model coeffs
+        mutate(is_min = lambda == glmnet_cv$lambda.min,
+               is_1se = lambda == glmnet_cv$lambda.1se,
+               pos_df_min = is_min & df > 0,
+               pos_df_1se = is_1se & df > 0)
+      
+      tgt_lambda <- 
+        if (!lambda_df[lambda_df$is_1se, "pos_df_1se"]) {
+          NULL
+        } else if (!lambda_df[lambda_df$is_1se, "pos_df_1se"] &
+                   lambda_df[lambda_df$is_min, "pos_df_min"]) {
+          # ID lambda closes to 1se value with >0 df
+          lambda_df[lambda_df$lambda >= glmnet_cv$lambda.min &
+                      lambda_df$df > 0, "lambda"] |> max()
+        } else {
+          lambda_df[lambda_df$is_1se, "lambda"]
+        }
+      
+      # selected coefficients
+      coeffs_0 <- if (!is.null(tgt_lambda)){
+        coef(glmnet_cv, s = tgt_lambda, gamma = "gamma.min")}
+      coeff_vals <- as.numeric(coeffs_0)
+      names(coeff_vals) <- rownames(coeffs_0)
+      coeffs <- 
+        rownames(coeffs_0)[coeff_vals != 0 & rownames(coeffs_0) != "(Intercept)"]
+      
+      # linear model fit for evaluation
+      coded_formula <- 
+        paste0("value ~ 1", if (!is.null(tgt_lambda)){" + "}, 
+               paste(coeffs, collapse = " + "))
+      coded_lm <- lm(formula = as.formula(coded_formula), data = data_)
+      
+      resid_fit_df <- 
+        data.frame(
+          run = data[[run_var]],
+          obs = yvec,
+          fits <- predict(coded_lm),
+          resid_raw = residuals(coded_lm),
+          resid_std = rstandard(coded_lm)
+        )
+      
+      # coefficients summaries - coded and uncoded model
+      coded_form <- coef(coded_lm)
+      coded_names <- names(coded_form)
+      coded_names[1] <- "" # unname Intercept
+      coded_form <- round_(coded_form, 2)
+      coded_form <- 
+        paste0(coded_form[1], if (length(coded_form) > 1){" + "},
+               if (length(coded_form) > 1) {
+                 paste(paste0(coded_form[-1], " * ", coded_names[-1]),
+                       collapse = " + ")}
+               )
+      
+      if (only_coded) {
+        uncoded_lm <- NULL
+        uncoded_form <- ""
+      } else {
+        uncoded_lm <- 
+          lm(formula = as.formula(gsub(code_suffix, "", coded_formula)), data = data_)
+        uncoded_form <- coef(uncoded_lm)
+        uncoded_names <- names(uncoded_form)
+        uncoded_names[1] <- ""
+        uncoded_form <- round_(uncoded_form, 2)
+        uncoded_form <- 
+          paste0(uncoded_form[1], if (length(uncoded_form) > 1){" + "},
+                 if (length(uncoded_form) > 1) {
+                   paste(paste0(uncoded_form[-1], " * ", uncoded_names[-1]),
+                         collapse = " + ")}
+                )
+      }
+      
+      lm_summary_df <- 
+        data.frame(
+          coded_model = gsub("\\+ -", "- ", coded_form),
+          uncoded_model = gsub("\\+ -", "- ", uncoded_form),
+          # these are same between coded and uncoded models
+          adj_r2 = summary(coded_lm)$adj.r.squared,
+          press = calc_PRESS_pred_rsq(coded_lm)["PRESS"],
+          pred_r2 = calc_PRESS_pred_rsq(coded_lm)["pred_rsq"]
+        )
+      
+      resid_fit_plot <- 
+        ggplot(resid_fit_df, 
+               aes(x = fits, y = resid_std, color = abs(resid_std) >= 3)) +
+        geom_hline(yintercept = c(-3, 0, 3), 
+                   linetype = c("dashed", "solid", "dashed")) +
+        geom_point(size = 3, shape = 21, stroke = 1) +
+        scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+        guides(color = "none") +
+        labs(title = paste("Residual vs. Fitted Values Plot for", yvars[i]),
+             x = "OLS Fitted Value",
+             y = "Internally Studentized Residual") +
+        theme_bw()
+      
+      qqnorm_plot <- 
+        ggplot(resid_fit_df, aes(sample = resid_std)) +
+        geom_qq_line(linetype = "dashed") +
+        geom_qq(size = 3, shape = 1, color = "navy") +
+        labs(title = paste("Q-Q Normal Plot for", yvars[i])) +
+        theme_bw()
+      
+      list(
+        "data" = data_,
+        "resp" = yvars[i],
+        "glmnet_cv" = glmnet_cv,
+        "tgt_lambda" = tgt_lambda,
+        "tgt_gamma" = glmnet_cv$gamma.min,
+        "lambda_df" = lambda_df,
+        "lm_cd" = coded_lm,
+        "glmnet_cv_coeffs" = coeff_vals[coeff_vals != 0],
+        "cd_coeffs" = coef(coded_lm),
+        "uncd_coeffs" = if (!only_coded){coef(uncoded_lm)},
+        "lm_summary_df" = lm_summary_df,
+        "resid_fit_df" = resid_fit_df,
+        "resid_fit_plot" = resid_fit_plot,
+        "qqnorm_plot" = qqnorm_plot
+      )
+    })
+  }
+
+# function to output desired elements
+output_set <- function(list_obj, component) {
+  lapply(seq_along(list_obj), function(i) {list_obj[[i]][[component]]})
+}
+
+# function to generate 'lm_summary_df' and diagnostics output 
+#   from manual model selection (may be needed to enforce model hierarchy
+#   based on LASSO-selected model)
+# inputs:
+# - lm_form_df : data.frame with columns 
+#     'y' (response colnames in 'data')
+#     'x_cd' (model right hand side using coded column names in 'data')
+#       e.g. 'x1_cd + x2_cd'
+#     'x_uncd' (only if 'only_coded = FALSE') (model RHS using uncoded colnames 
+#       in 'data')
+# - data : data.frame for model fitting, in 'wide' form
+# - only_coded : TRUE/FALSE whether to model only coded-scale inputs
+# - run_var : string for colname in 'data' for run identifier (NULL if not used)
+# output:
+# - list of length nrow(lm_form_df)
+# -- lm_cd : coded-scale final lm object
+# -- lm_summary_df : data.frame with summary details of coded/uncoded model terms
+#      and metrics (AdjR2, PRESS, PredR2)
+# -- resid_fit_df : residual-vs-fits data.frame for coded-scale lm data
+# -- resid_fit_plot : residual-vs-fits plot for coded-scale lm
+# -- qqnorm_plot : quantile-quantile normal plot for coded-scale lm
+get_lm_eval <- function(lm_form_df, data, only_coded = FALSE, run_var = NULL) {
+  lapply(1:nrow(lm_form_df), function(i) {
+    colnames(data)[which(colnames(data) == lm_form_df$y[i])] <- "value"
+    lm_cd <- lm(as.formula(paste0("value ~ ", lm_form_df$x_cd[i])), data)
+    
+    resid_fit_df <- 
+      data.frame(
+          if (!is.null(run_var)) {run = data[[run_var]]},
+          obs = residuals(lm_cd) + predict(lm_cd), ## TODO: replace with data[[lm_form_df$y[i]]] ??
+          fits = predict(lm_cd),
+          resid_raw = residuals(lm_cd),
+          resid_std = rstandard(lm_cd)
+        )
+    
+    if (!is.null(run_var)) {colnames(resid_fit_df)[1] <- run_var}
+    
+    # coefficients summaries - coded and uncoded model
+      cd_form <- coef(lm_cd)
+      cd_names <- names(cd_form)
+      cd_names[1] <- "" # unname Intercept
+      cd_form <- round_(cd_form, 2)
+      cd_form <- 
+        paste0(cd_form[1], if (length(cd_form) > 1){" + "},
+               if (length(cd_form) > 1) {
+                 paste(paste0(cd_form[-1], " * ", cd_names[-1]),
+                       collapse = " + ")}
+               )
+      
+      if (only_coded) {
+        uncd_lm <- NULL
+        uncd_form <- ""
+      } else {
+        uncd_lm <- 
+          lm(as.formula(paste0("value ~ ", lm_form_df$x_uncd[i])), data)
+        uncd_form <- coef(uncd_lm)
+        uncd_names <- names(uncd_form)
+        uncd_names[1] <- ""
+        uncd_form <- round_(uncd_form, 2)
+        uncd_form <- 
+          paste0(uncd_form[1], if (length(uncd_form) > 1){" + "},
+                 if (length(uncd_form) > 1) {
+                   paste(paste0(uncd_form[-1], " * ", uncd_names[-1]),
+                         collapse = " + ")}
+                )
+      }
+      
+      lm_summary_df <- 
+        data.frame(
+          response = lm_form_df$y[i],
+          coded_model = gsub("\\+ -", "- ", cd_form),
+          uncoded_model = gsub("\\+ -", "- ", uncd_form),
+          # these are same between coded and uncoded models
+          adj_r2 = summary(lm_cd)$adj.r.squared,
+          press = calc_PRESS_pred_rsq(lm_cd)[["PRESS"]],
+          pred_r2 = calc_PRESS_pred_rsq(lm_cd)[["pred_rsq"]]
+        )
+      
+      resid_fit_plot <- 
+        ggplot(resid_fit_df, 
+               aes(x = fits, y = resid_std, color = abs(resid_std) >= 3)) +
+        geom_hline(yintercept = c(-3, 0, 3), 
+                   linetype = c("dashed", "solid", "dashed")) +
+        geom_point(size = 3, shape = 21, stroke = 1) +
+        scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+        guides(color = "none") +
+        labs(title = paste("Residual vs. Fitted Values Plot for", lm_form_df$y[i]),
+             x = "OLS Fitted Value",
+             y = "Internally Studentized Residual") +
+        theme_bw()
+      
+      qqnorm_plot <- 
+        ggplot(resid_fit_df, aes(sample = resid_std)) +
+        geom_qq_line(linetype = "dashed") +
+        geom_qq(size = 3, shape = 1, color = "navy") +
+        labs(title = paste("Q-Q Normal Plot for", lm_form_df$y[i])) +
+        theme_bw()
+      
+      list(
+        "lm_cd" = lm_cd,
+        "lm_uncd" = uncd_lm,
+        "lm_summary_df" = lm_summary_df,
+        "resid_fit_df" = resid_fit_df,
+        "resid_fit_plot" = resid_fit_plot,
+        "qqnorm_plot" = qqnorm_plot
+      )
+    
+  })
+}
+
+# function to generate prediction data.frames for eval
+# inputs:
+# - main_terms : list with 1 entry per term of main-effect values; 
+#     supports vector of values for each list entry (must be same length to work)
+# - main_terms_names: character vector of 'reporting-ready' main-effect labels,
+#     aligned with number of 'main_terms' entries
+#     note: entries should -not- have any underscores
+# - terms_suffix : suffix appended to term colnames (default denotes coded-scale)
+# - incl_2term_int : TRUE/FALSE whether 2-term interactions should be included
+# - incl_quadratic : TRUE/FALSE whether quadratic effects should be included
+# - quad_suffix : suffix to append to quadratic term colnames
+# output:
+# - data.frame with created terms and corresponding values
+## TODO: look into making main_terms a named list containing values (then rename & remove main_terms_names and refactor accordingly)
+make_newdata <- 
+  function(main_terms, main_terms_names, terms_suffix = "_cd", 
+           incl_2term_int = TRUE, incl_quadratic = TRUE, quad_suffix = "_sq") {
+    df_ <- as.data.frame(as.list(main_terms))
+    colnames(df_) <- paste0(main_terms_names, terms_suffix)
+    
+    if (incl_2term_int) {
+      combos <- t(combn(main_terms_names, m = 2))
+      combos <- apply(combos, 1, paste, collapse = "_")
+      term_1 <- term_2 <- ""
+      
+      # generate combination sets
+      for (i in seq_along(combos)) {
+        term_1 <- paste0(sub("^(.+)_.+$", "\\1", combos[i]), terms_suffix)
+        term_2 <- paste0(sub("^.+_(.+)$", "\\1", combos[i]), terms_suffix)
+        df_[[paste0(combos[i], terms_suffix)]] <- 
+          df_[[term_1]] * df_[[term_2]]
+      }
+    }
+    
+    if (incl_quadratic) {
+      for (i in seq_along(main_terms)) {
+        df_[[paste0(main_terms_names[i], quad_suffix, terms_suffix)]] <- 
+          df_[,i]^2
+      }
+    }
+    df_
+  }
+```
+
+# Building the Design
+
+```{r dode-design}
+dode_dsgn <- 
+  make_optimal_dode(
+    n_components = 3, 
+    n_runs = 20, 
+    run_length = 15, 
+    run_incrmt = 1, 
+    n_rplcts = 3, 
+    rplct_vec = c(0, 0, 0), 
+    optimality = "I", 
+    factor_name = "dynam", 
+    time_name = "hours", 
+    rng_seed = 42, 
+    rplct_shuffle_seed = 24, 
+    coded_seq_len = 5, 
+    banned_runs = NULL, 
+    factor_low = 10, 
+    factor_high = 20, 
+    design_iter = 100, 
+    design_repeat = 5
+  )
+
+# visualize the design
+expmt_traj_viz <- 
+visualize_dode(design_data = dode_dsgn$design,
+               data_from_from_make_optimal_dode = TRUE)
+```
+
+```{r sim-data}
+# simulate data
+# assume titer has quadratic optimal trajectory,
+# cIEF Main has linear optimal trajectory,
+# cIEF Acidic has negatively-correlated linear optimal trajectory,
+# CGE reduced has static optimal trajectory
+sim_titer <- function(x1, x2, x3) {
+  6.5 - 3 * x1 + 7 * x2 - 0.5 * x3  + 
+    2 * x1 * x2 - 4 * x1 * x3 +
+    1.5 * x1^2 + rnorm(1)}
+sim_main <- function(x1, x2) {55 + 12 * x1 + 12 * x2 + 7 * x2^2 + rnorm(1)}
+sim_acid <- function(x1, x2) {20 + 2 * x1 - 3.5 * x2 - 1 * x1 * x2 + rnorm(1)}
+sim_cger <- function(x1) {86 + 14 * x1 + rnorm(1)}
+
+expmt_data <- dode_dsgn$design
+set.seed(42)
+expmt_data$titer <- 
+  apply(expmt_data[, grep("^x[0-9]_scaled$", colnames(expmt_data))],
+        1, 
+        \(x){sim_titer(x[1], x[2], x[3])})
+
+# confirming this is correct (checked with the 'rnorm(1)' component commented-out)
+# chk <- vector("numeric", length(nrow(expmt_data)))
+# for (i in 1:nrow(expmt_data)) {
+#   chk[i] <- sim_titer(x1 = expmt_data$x1_scaled[i],
+#                       x2 = expmt_data$x2_scaled[i],
+#                       x3 = expmt_data$x3_scaled[i])
+# }
+#  
+# mean(chk - expmt_data$titer == 0) # success!
+
+expmt_data$main <- 
+  apply(expmt_data[, grep("^x[0-9]_scaled$", colnames(expmt_data))],
+        1, 
+        \(x){sim_main(x[1], x[2])})
+
+expmt_data$acid <- 
+  apply(expmt_data[, grep("^x[0-9]_scaled$", colnames(expmt_data))],
+        1, 
+        \(x){sim_acid(x[1], x[2])})
+
+expmt_data$cger <- 
+  apply(expmt_data[, grep("^x[0-9]_scaled$", colnames(expmt_data))],
+        1, 
+        \(x){sim_cger(x[1])})
+
+# 100 - (expmt_data$main + expmt_data$acid) # main + acidic + basic == 100
+```
+
+```{r analyze-data}
+# include all code-scale model terms for model selection eval
+df_ <- 
+  expmt_data |> 
+  mutate(
+    x1 = x1_scaled,
+    x2 = x2_scaled,
+    x3 = x3_scaled
+  ) |> select(c(x1, x2, x3))
+
+df_ <- 
+make_newdata(
+  main_terms = list(df_$x1, df_$x2, df_$x3),
+  main_terms_names = paste0("x", c(1:3)),
+  terms_suffix = "_cd",
+  incl_2term_int = TRUE, 
+  incl_quadratic = TRUE 
+)
+
+df_$Run <- expmt_data$Run
+
+expmt_data <- full_join(expmt_data, df_, by = "Run")
+
+dode_lin_eval <- 
+  eval_lin_mods(
+    data = expmt_data,
+    yvars = c("titer", "main", "acid", "cger"),
+    xvars = colnames(df_)[-ncol(df_)],
+    code_suffix = "_scaled",
+    only_coded = TRUE
+  )
+```
+
+```{r model-eval}
+output_set(dode_lin_eval, "cd_coeffs")
+
+# no cases where model hierarchy is violated; if it had been,
+# need to evaluate whether the simpler or more complex model has better metrics
+
+# for example, imagine if the titer model (output set 1 above) 
+# included the x2_x3_cd term, but not the x2_cd term - this violates model hierarchy
+# ...should x2_x3_cd be excluded, or should x2_cd be added?
+
+output_set(dode_lin_eval, "lm_cd") |> lapply(FUN = calc_PRESS_pred_rsq)
+# titer and cIEF acidic have decent predR2, cIEF main and CGE-Red purity are great
+dode_lin_eval[[1]]$lm_cd |> summary() # going by pvals, maybe drop x1:x3
+dode_lin_eval[[3]]$lm_cd |> summary() # going by p-vals, nothing to drop...add x1:x2?
+
+
+# quick helper function to build the model rhs vector
+make_mod_rhs <- function(terms, suffix) {
+  paste(paste0(terms, suffix), collapse = " + ")
+}
+
+lm_eval_example <- 
+  get_lm_eval(
+    lm_form_df = 
+      data.frame(y = "titer",
+                 # first row: original model (includes x1_x3_cd)
+                 # second row: reduced model (drop x1_x3_cd)
+                 x_cd = 
+                   c(make_mod_rhs(c("x1", "x2", "x3", "x1_x3", "x2_x3", "x1_sq"), "_cd"),
+                     make_mod_rhs(c("x1", "x2", "x3",          "x2_x3", "x1_sq"), "_cd"))
+                 ),
+    data = expmt_data,
+    only_coded = TRUE, 
+    run_var = "Run"
+    )
+
+lapply(output_set(lm_eval_example, "lm_cd"), calc_PRESS_pred_rsq)
+# pretty clear the expanded is better!
+
+# let's check model diagnostics for the final linear models
+output_set(dode_lin_eval, "resid_fit_plot")
+output_set(dode_lin_eval, "qqnorm_plot")
+# titer is somewhat platykurtic (heavy-tailed); at least it's symmetric
+# ...and the residual vs. fit plots are alright
+```
+
+```{r optim-fxn}
+# new function time!
+
+# function to optimize point predictions for time-dynamic models
+# and evaluate against grid search ---------------------------------------------
+# note: lme4::Nelder_Mead allows box constraints on inputs
+#       and appears more consistent than stats::optim result
+# TODO: when time allows, look into coding up a gradient-calculating function
+#       (vector of first derivatives of the objective function inputs to x...
+# inputs:
+# - coded_lm_list : list of coded-scale linear models (entry names = response) 
+# - y_constr_list : list of vectors of constraints on the response for each model
+#     entry order for each vector is: c(min, max, less than/equal to, greater than/equal to)
+#     where min/max are '1' for true and '0' for false and below/above are numeric
+#     note: set 'below' and 'above' to the same value if an exact value is required
+#     note: set 'below' and 'above' to NA_real_ if they are not required for a given response
+# note: coded_lm_list and y_constr_list entries should each be named with 
+#       the response string
+# - n_subfctr : integer of time-dynamic subfactors in the design
+# - n_subfctr_optim : number of time-dynamic subfactors to consider in the 
+#     optimization process
+#     note: optimization can focus on between 1 and 'n_subfctr' entries
+#           (e.g. optimizes time-static inputs when static = TRUE, 
+#            optimizes slope-intercept trajectory when n_subfctr = 2, etc.)
+#     note: intercept-only (n_fctr_suboptim = 1) is provided automatically
+# - optim_init : vector of initial values for the input values (must match n_subfctr length)
+# - terms_base : base string for input factor colnames
+# - terms_suffix : string appended to terms_base for input factor colnames
+# - quad_suffix : string appended to terms base for input factor colnames
+#     note: name structure for input factors to optimize must be 
+#           [terms_base][#][quad_suffix][terms_suffix]
+# - optim_ctl : list-argument passed to lme4::Nelder_Mead 'control' argument
+# - grid_search_seq_list : list of seq(lwr, upr, by/length.out) for grid-search 
+#     of combinations of n_subfctr_optim time-dynamic subfactor inputs
+#     note: if used for plotting a 'heat map' type visual,
+#       a relatively 'rich' search grid may be required, resulting
+#       in longer runtime and a larger data.frame
+#       consider running a coarser series of sequences each spanning [-1, 1]
+#       as a first-pass evaluation of the plausible design space,
+#       then use higher-frequency sequences limited to the plausible space 
+#       (and a bit beyond) for the final output
+# - grid_search_force_par : optional numeric vector of time-dynamic subfactor values
+#     to include in the search grid; useful to allow visualizing
+#     how e.g. the best-observed result fares in the search grid
+# - last_n_subfctr_fixed_in_grid : integer; if positive, rather than search over 
+#     seq(-1, 1, grid_search_incr) the last [#] subfactor components,
+#     only allow values from that entry in the optimized (general or intercept-only)
+#     and (optional) grid_search_force_par vectors;
+#     this helps manage runtime and 'search grid' data.frame output 
+#     when the output is intended for visualization
+# outputs:
+# - optim_out : output of the user-specified optimization
+# - preds : prediction vector of responses from 'optim_out'
+# - optim_out_int : output of the intercept-only optimization
+# - preds_int : prediction vector of responses from 'optim_out_int'
+# - search_grid : grid-search evaluation of inputs and resulting response estimates
+# note: very important that the 'base' and 'suffix' terms directly align with 
+#       those used in 'data' for eval_lin_mods()
+# TODO: troubleshoot optimizer function - keeps settling at init (local optimum? tolerance limit?)
+
+optimize_dynamic_models <- 
+  function(coded_lm_list, y_constr_list, static = FALSE,
+           n_subfctr, n_subfctr_optim, optim_init,
+           terms_base = "x", terms_suffix = "_cd", quad_suffix = "_sq", 
+           optim_ctl = list(), grid_search_seq_list = NULL, grid_search_force_par = NULL,
+           last_n_subfctr_fixed_in_grid = 0) {
+    library(lme4)
+    if (n_subfctr_optim > n_subfctr){stop("n_subfctr_optim cannot exceed n_subfctr")}
+    if (mean(names(coded_lm_list) == names(y_constr_list)) < 1){
+      stop("coded_lm_list and y_constr_list entries should have directly aligned names (the response)")
+    }
+    if (length(optim_init) != n_subfctr){stop("optim_init length must align with n_subfctr")}
+    
+    # check constraints have logical structure
+    constr_chk <- 
+      lapply(seq_along(y_constr_list), function(i) {
+        ycl <- y_constr_list[[i]]
+        if (any(ycl[1] == 1 & ycl[2] == 1, 
+                !(ycl[1] %in% c(0, 1)), 
+                !(ycl[2] %in% c(0, 1)))) {
+          stop(paste("y_constr_list entry", i, 
+                     "must have at most 1 of first 2 entries as '1' (else '0')"))}
+        if (!is.na(ycl[3]) & !is.na(ycl[4]) & ycl[3] > ycl[4]) {
+          stop(paste("y_constr_list entry", i,
+                     "cannot have the 3rd entry greater than the 4th entry"))}
+      })
+    # cannot both minimize and maximize
+    # TODO: consider incorporating a weighting factor for importance of 
+    #       each constraint - would need to standardize if both min and max exist
+    if (sum(vapply(y_constr_list, `[`, numeric(2L), 1:2)) > 1) {
+      stop("two or more vectors in y_constr_list have a '1' in 1st / 2nd entry;
+           currently at most one vector may have a '1' in those entries")
+    }
+    if (!is.null(grid_search_force_par) & length(grid_search_force_par) != n_subfctr) {
+      stop("grid_search_force_par length must match n_subfctr")
+    }
+    
+    # TODO: add more warnings (e.g. all responses constrained to exact values --> warn optimization may fail)
+
+    # identify constraints on responses
+    max_idx <- which(vapply(y_constr_list, `[`, numeric(1L), 1) == 1)
+    min_idx <- which(vapply(y_constr_list, `[`, numeric(1L), 2) == 1)
+    gte_idx <- which(!is.na(vapply(y_constr_list, `[`, numeric(1L), 3)))
+    gte_vals <- if (length(gte_idx) > 0){vapply(y_constr_list, `[`, numeric(1L), 3)[gte_idx]}
+    lte_idx <- which(!is.na(vapply(y_constr_list, `[`, numeric(1L), 4)))
+    lte_vals <- if (length(lte_idx) > 0){vapply(y_constr_list, `[`, numeric(1L), 4)[lte_idx]}
+
+    optim_fxn <- function(x){
+      if (sum(abs(x)) <= 1){ # valid space for shifted Legendre polynomials
+        pred_df <-
+          make_newdata(main_terms = x,
+                       main_terms_names = paste0(terms_base, 1:length(x)),
+                       terms_suffix = terms_suffix, quad_suffix = quad_suffix)
+        
+        # note: if objective is to protect against downside risk,
+        #   an alternate approach might be to calculate conf/pred int 
+        #   (pass level and interval to vapply())
+        #   and then evaluate relative to that
+        #   - maximize(/gte): eval against lower limit 
+        #   - minimize(/lte): eval against upper limit
+        preds_vec <- vapply(coded_lm_list, predict, numeric(1L), newdata = pred_df)
+        # optimization target is to minimize function result
+        max_val <- if (length(max_idx) > 0) {1 / preds_vec[max_idx]} else {1}
+        min_val <- if (length(min_idx) > 0) {preds_vec[min_idx]} else {1}
+        gte_ok <- length(gte_idx) == 0 |
+          (length(gte_idx) > 0 &
+           all(preds_vec[gte_idx] >= gte_vals))
+        lte_ok <- length(lte_idx) == 0 |
+          (length(lte_idx) > 0 &
+           all(preds_vec[lte_idx] <= lte_vals))
+        
+        if (gte_ok & lte_ok){max_val * min_val} else {Inf}
+      } else {Inf}
+    }
+      
+    # TODO: evaluate impact of adjusting hyperparams (e.g. alpha/beta/gamma for Nelder-Mead)
+    optim_eval <- 
+      lme4::Nelder_Mead(
+        fn = optim_fxn,
+        par = optim_init,
+        control = optim_ctl,
+        lower = rep(c(-1, 0), times = c(n_subfctr_optim, n_subfctr - n_subfctr_optim)),
+        upper = rep(c(1, 1e-15), times = c(n_subfctr_optim, n_subfctr - n_subfctr_optim))
+      )
+    
+    # intercept-only evaluation for comparison of DoDE vs. 'regular' DoE
+    optim_eval_intonly <- 
+      lme4::Nelder_Mead(
+        fn = optim_fxn,
+        par = optim_init,
+        control = optim_ctl,
+        lower = rep(c(-1, 0), times = c(1, n_subfctr - 1)),
+        # lower < upper is required - force an effectively-0 upper limit
+        upper = rep(c(1, 1e-15), times = c(1, n_subfctr - 1))
+      )
+    
+    # optimized result
+      pred_df <- 
+        make_newdata(main_terms = optim_eval$par,
+                     main_terms_names = paste0(terms_base, 1:length(optim_eval$par)),
+                     terms_suffix = terms_suffix, quad_suffix = quad_suffix)
+    
+      preds_vec <- 
+        vapply(coded_lm_list, predict, numeric(1L), newdata = pred_df)
+      
+      names(preds_vec) <- names(coded_lm_list)
+      
+      pred_df_int <- 
+        make_newdata(main_terms = optim_eval_intonly$par,
+                     main_terms_names = paste0(terms_base, 1:length(optim_eval_intonly$par)),
+                     terms_suffix = terms_suffix, quad_suffix = quad_suffix)
+    
+      preds_vec_int <- 
+        vapply(coded_lm_list, predict, numeric(1L), newdata = pred_df_int)
+      
+      names(preds_vec) <- names(preds_vec_int) <- names(coded_lm_list)
+      
+      # 'manual' grid search for comparison and use in visualization
+      search_grid <-
+        lapply(1:n_subfctr, function(i) {
+          # ensure optimization values are included - supports visualization
+          if (i <= n_subfctr_optim){ # round resolves allowing up to 1e-15 for int-only non-int limits
+            if (i <= n_subfctr - last_n_subfctr_fixed_in_grid) {
+              c(optim_eval$par[i], round(optim_eval_intonly$par[i], 14),
+              if (!is.null(grid_search_force_par)){grid_search_force_par[i]},
+              grid_search_seq_list[[i]])
+            } else {
+              c(optim_eval$par[i], round(optim_eval_intonly$par[i], 14),
+              if (!is.null(grid_search_force_par)){grid_search_force_par[i]})
+              }
+            } else {0}
+        }) |> expand.grid()
+      plausible_idx <- apply(search_grid, 1, function(x){sum(abs(x)) <= 1})
+      search_grid <- search_grid[plausible_idx,]
+      colnames(search_grid) <- paste0(terms_base, 1:n_subfctr, terms_suffix)
+      # evaluate if search grid responses meet <= / >= criteria
+      s_g_y <- matrix(nrow = nrow(search_grid), ncol = length(coded_lm_list) + 1,
+                      dimnames = list(NULL, c("idx", names(coded_lm_list))))
+      for (i in 1:nrow(s_g_y)){
+        s_g_y[i, 1] <- i
+        s_g_y[i, 2:ncol(s_g_y)] <-
+          vapply(coded_lm_list, predict, numeric(1L),
+                 newdata =
+                   make_newdata(main_terms = search_grid[i,],
+                                main_terms_names = paste0(terms_base, 1:n_subfctr),
+                                terms_suffix = terms_suffix, quad_suffix = quad_suffix))
+      }
+      s_g_y <- 
+        cbind(s_g_y, 
+              matrix(nrow = nrow(s_g_y), ncol = 2, 
+                     dimnames = list(NULL, c("gte_ok", "lte_ok"))))
+
+      if (length(gte_idx) == 0L) {s_g_y[, ncol(s_g_y) - 1] <- 1
+      } else {
+        for (i in 1:nrow(s_g_y)) {
+          s_g_y[i, ncol(s_g_y) - 1] <- all(s_g_y[i, gte_idx + 1] >= gte_vals)
+        }
+      }
+      if (length(lte_idx) == 0L) {s_g_y[, ncol(s_g_y)] <- 1
+      } else {
+        for (i in 1:nrow(s_g_y)) {
+          s_g_y[i, ncol(s_g_y)] <- all(s_g_y[i, lte_idx + 1] <= lte_vals)
+        }
+      }
+
+      search_grid <- cbind(search_grid, s_g_y)
+      search_grid$gte_lte_ok <- search_grid$gte_ok * search_grid$lte_ok
+      search_grid$intonly <- apply(search_grid[,c(1:n_subfctr)], 1, 
+                                   function(x){as.numeric(all(x[-1] == 0))})
+
+      list("optim_out" = optim_eval, 
+           "preds" = preds_vec, 
+           "optim_out_int" =  optim_eval_intonly,
+           "preds_int" = preds_vec_int,
+           "search_grid" = search_grid)
+  }
+```
+
+
+```{r eval-viz}
+# best observed result in the experimental data
+bestobs_df <- 
+  expmt_data |> 
+  filter(main >= 50, acid <= 40, cger >= 85) |> 
+  arrange(desc(titer)) |> 
+  head(1)
+
+params_bestobs <- 
+  bestobs_df |> 
+  select(x1_cd, x2_cd, x3_cd) |> 
+  as.numeric()
+
+cd_lm_lst <- output_set(dode_lin_eval, "lm_cd")
+names(cd_lm_lst) <- output_set(dode_lin_eval, "resp")
+
+main_tgt_min <- 50
+acid_tgt_max <- 40
+cger_tgt_min <- 85
+
+y_cnstr_lst <- 
+  list("titer" = c(1, 0, NA_real_, NA_real_),
+       "main" = c(0, 0, main_tgt_min, 100),
+       "acid" = c(0, 0, 0, acid_tgt_max),
+       "cger" = c(0, 0, cger_tgt_min, 100))
+
+res <- 
+optimize_dynamic_models(
+  coded_lm_list = cd_lm_lst, 
+  y_constr_list = y_cnstr_lst, 
+  n_subfctr = 3, 
+  n_subfctr_optim = 3, 
+  optim_init = c(0, 0, 0),
+  terms_base = "x", 
+  terms_suffix = "_cd", 
+  quad_suffix = "_sq",
+  optim_ctl = list(),
+  grid_search_seq_list = 
+    list(seq(-0.1, 1, by = 0.01), seq(-1, 1, by = 0.01), seq(-1, 1, by = 0.1)),
+  grid_search_force_par = params_bestobs,
+  last_n_subfctr_fixed_in_grid = 1)
+
+# visualize optimized results vs. grid-search observations
+params_opt <- res$optim_out$par
+params_int <- round(res$optim_out_int$par, 14)
+
+params_compare_df <- 
+  data.frame(
+    src = c("optim", "int.only", "best.obs"),
+    x1 = c(params_opt[1], params_int[1], params_bestobs[1]),
+    x2 = c(params_opt[2], params_int[2], params_bestobs[2]),
+    x3 = c(params_opt[3], params_int[3], params_bestobs[3])
+  ) |> 
+  mutate(src = factor(src, levels = c("int.only", "best.obs", "optim"))) |> 
+  arrange(src)
+
+sg <- 
+  res$search_grid |>  
+  # align 'optim' and 'int' visual groups by the n > 2 subfactors
+  # (subfactors 1 and 2 will form x-/y-axis ranges)
+  mutate(
+    pt_grp =
+      case_when(
+        x1_cd == params_opt[1] &
+          x2_cd == params_opt[2] & 
+          x3_cd == params_opt[3] ~ "optim",
+        x1_cd == params_int[1] &
+          x2_cd == params_int[2] &
+          x3_cd == params_int[3] ~ "int.only",
+        x1_cd == params_bestobs[1] &
+          x2_cd == params_bestobs[2] &
+          x3_cd == params_bestobs[3] ~ "best.obs",
+        TRUE ~ "other"
+      ),
+    x3_grp = 
+      case_when(
+        x3_cd == params_opt[3] ~ "optim",
+        x3_cd == params_int[3] ~ "int.only",
+        x3_cd == params_bestobs[3] ~ "best.obs",
+        TRUE ~ "other"
+      )
+  ) |> 
+  filter(x3_grp !=  "other") |> 
+  mutate(x3_grp = factor(x3_grp, levels = levels(params_compare_df$src)),
+         fail_main = main < main_tgt_min,
+         fail_acid = acid > acid_tgt_max,
+         fail_cger = cger < cger_tgt_min,
+         # geom_raster require equally-spaced increments for x- and y-axis inputs
+         # need to exclude 'non smooth' entries from the fill
+         fill_excl = x1_cd == params_int[1] | x2_cd %in% c(params_bestobs[2], params_opt[2]),
+         x1_cd = round(x1_cd, 5),
+         x2_cd = round(x2_cd, 5))
+
+# function to build comparison 'heatmap' plots
+
+build_heatmap_comparison <- 
+  function(data, x, y, fill, facet, color = NULL, title = NULL, subtitle = NULL, caption = NULL) {
+    fill_data <- filter(data, !fill_excl)
+    pt_data <- filter(data, pt_grp != "other") |> select(-idx) |> unique()
+    n_fct <- length(unique(data[[facet]]))
+    
+    ggplot(fill_data, aes(x = !!sym(x), y = !!sym(y), fill = !!sym(fill))) +
+      facet_wrap(facets = vars(!!sym(facet)), ncol = max(3, n_fct)) +
+      geom_raster(interpolate = TRUE) +
+      {if (!is.null(color)) {
+        list(geom_point(aes(color = !!sym(color)), shape = 4),
+             scale_color_manual(values = c("FALSE" = "#5b5b5b00", "TRUE" = "#5b5b5b50"),
+                                guide = "none"))}} +
+      geom_point(data = pt_data, aes(shape = pt_grp), size = 2) +
+      labs(title = title, subtitle = subtitle, caption = caption, 
+           x = "x1", y = "x2") +
+      scale_fill_viridis_c(direction = -1) +
+      scale_shape_manual(values = c(0:2), guide = "none") +
+      theme_bw()
+  }
+
+build_heatmap_comparison(
+  data = sg, x = "x1_cd", y = "x2_cd", fill = "titer", facet = "x3_grp", 
+  title = "Predicted Titer with optimized prediction as plotted points",
+  subtitle = "Simulated data - greater is better",
+  caption = "'int.only': optimized 'static' estimate, 'best.obs': best observed result-based estimate,\n'optim': optimized 'dynamic' estimate"
+)
+
+build_heatmap_comparison(
+  data = sg, x = "x1_cd", y = "x2_cd", fill = "main", facet = "x3_grp", color = "fail_main", 
+  title = "Predicted cIEF Main with optimized prediction as plotted points",
+  subtitle = "Simulated data - greater is better",
+  caption = paste0("'int.only': optimized 'static' result, 'best.obs': best observed result,\n'optim': optimized 'dynamic result\ngrey 'x' on points failing Main target (\u2265 ", main_tgt_min, ")")
+)
+
+build_heatmap_comparison(
+  data = sg, x = "x1_cd", y = "x2_cd", fill = "acid", facet = "x3_grp", color = "fail_acid", 
+  title = "Predicted cIEF Acidic with optimized prediction as plotted points",
+  subtitle = "Simulated data - greater is better",
+  caption = paste0("'int.only': optimized 'static' result, 'best.obs': best observed result,\n'optim': optimized 'dynamic result\ngrey 'x' on points failing Acid target (\u2264 ", acid_tgt_max, ")")
+)
+
+build_heatmap_comparison(
+  data = sg, x = "x1_cd", y = "x2_cd", fill = "cger", facet = "x3_grp", color = "fail_cger", 
+  title = "Predicted CGE Reduced Purity with optimized prediction as plotted points",
+  subtitle = "Simulated data - greater is better",
+  caption = paste0("'int.only': optimized 'static' result, 'best.obs': best observed result,\n'optim': optimized 'dynamic result\ngrey 'x' on points failing CGE-R target (\u2265 ", cger_tgt_min, ")")
+)
+```
+
+```{r lin-eval}
+lm_eval_sets <- 
+  lapply(seq_along(dode_lin_eval), function(i) {
+    data.frame(
+      y = dode_lin_eval[[i]]$resp, 
+      x_cd = paste(names(dode_lin_eval[[i]]$cd_coeffs[-1]), collapse = "+") # don't need (Intercept)
+    )
+  }) |> 
+  do.call(what = rbind)
+
+lm_evals <- 
+  get_lm_eval(lm_eval_sets, data = expmt_data, only_coded = TRUE, run_var = "Run")
+
+lm_summary_df <- output_set(lm_evals, "lm_summary_df") |> do.call(what = rbind)
+```
+
+```{r optim-visuals}
+# prediction intervals for each optimization
+optim_pi_df <- 
+  lapply(seq_along(cd_lm_lst), function(i) {
+    pi95_optim <- 
+      predict(cd_lm_lst[[i]], newdata = make_newdata(params_opt, paste0("x", 1:3)),
+              level = 0.95, interval = "prediction")
+    pi95_int.only <- 
+      predict(cd_lm_lst[[i]], newdata = make_newdata(params_int, paste0("x", 1:3)),
+              level = 0.95, interval = "prediction")
+    pi95_best.obs <- 
+      predict(cd_lm_lst[[i]], newdata = make_newdata(params_bestobs, paste0("x", 1:3)),
+              level = 0.95, interval = "prediction")
+    
+    list("optim" = pi95_optim,
+         "int.only" = pi95_int.only,
+         "best.obs" = pi95_best.obs) |> 
+      do.call(what = rbind) |> 
+      data.frame(row.names = NULL) |> 
+      mutate(resp = names(cd_lm_lst)[i],
+             src = c("optim", "int.only", "best.obs"))
+  }) |> 
+  do.call(what = rbind) |> 
+  select(resp, src, everything()) |> 
+  mutate(resp = factor(resp, levels = c("titer", "main", "acid", "cger")))
+
+# visualize and compare to best observed result
+bestobs_df_ <- 
+  mutate(bestobs_df, 
+         src = "best.obs") |> 
+  select(src, titer, main, acid, cger) |> 
+  pivot_longer(cols = -"src", names_to = "resp", values_to = "value") |> 
+  mutate(resp = factor(resp, levels = c("titer", "main", "acid", "cger")))
+
+tgt_line_df <- 
+  data.frame(
+    resp = bestobs_df_$resp,
+    lwr = c(NA_real_, main_tgt_min, NA_real_, cger_tgt_min),
+    upr = c(NA_real_, NA_real_, acid_tgt_max, NA_real_)
+  ) |> 
+  pivot_longer(cols = -"resp", names_to = "lim", values_to = "yint")
+
+optim_pi_viz <- 
+  ggplot(optim_pi_df, aes(x = src)) +
+  facet_wrap(facets = vars(resp), scales = "free_y") +
+  geom_hline(data = tgt_line_df, mapping = aes(yintercept = yint, color = lim),
+             linetype = "dashed", linewidth = 0.7) +
+  geom_pointrange(aes(ymin = lwr, y = fit, ymax = upr)) +
+  geom_point(data = bestobs_df_, mapping = aes(y = value), 
+             position = position_nudge(x = 0.1),
+             shape = 1, size = 2) +
+  labs(title = "Point Estimate and 95% Pred. Int. for Responses by Estimate Source",
+       subtitle = "Open point: best observed result; Red/Blue lines: lower/upper limits",
+       caption = "'int.only': optimized 'static' estimate, 'best.obs': best observed result-based estimate,\n'optim': optimized 'dynamic' estimate") +
+  scale_color_manual(values = c("lwr" = "firebrick4", "upr" = "dodgerblue3"), guide = "none") +
+  theme_bw()
+```
+
+```{r trajectory-comparison}
+# colorized heat maps by response
+optim_tgt_traj_df <- 
+  calc_dynamic_fctr_tgt(
+      data = params_compare_df,
+      coded_fctr_cols = paste0("x", 1:3),
+      num_timepts = 15,
+      update_freq = 1,
+      nominal_ctr = (20 + 10) * 0.5,
+      nominal_incr = (20 - 10) * 0.5,
+      fctr_term = "dynam",
+      time_term = "hours"
+    ) |> 
+  pivot_longer(cols = starts_with("dynam"),
+               names_to = "timept", values_to = "value",
+               names_pattern = "dynam_hours_(.+)") |> 
+  mutate(timept = as.numeric(timept))
+
+expmt_data_ <- 
+  expmt_data |> 
+  select(x1 = x1_cd, x2 = x2_cd, x3 = x3_cd, 
+         starts_with("dynam"), titer, main, acid, cger, Run)
+
+
+expmt_data_long <- 
+  expmt_data_ |> 
+  pivot_longer(cols = starts_with("dynam"),
+               names_to = "timept", values_to = "value",
+               names_pattern = "dynam_hours_(.+)") |> 
+  mutate(timept = as.numeric(timept))
+  
+
+optim_vs_obs_viz <- 
+ggplot(expmt_data_long, aes(x = timept, y = value)) +
+  geom_line(color = "darkgrey", aes(group = Run)) +
+  geom_line(data = optim_tgt_traj_df,
+            mapping = aes(color = src), size = 1) +
+  labs(title = "Optimized Trajectories Overlaid on Experiment Trajectories",
+       x = "Hour", y = "Dynam", color = NULL) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_bw()
+
+expmt_resp_traj_viz <- 
+  lapply(1:4, function(i) {
+    ggplot(expmt_data_long, 
+            aes(x = timept, y = value,
+                color = !!sym(c("titer", "main", "acid", "cger")[i]),
+                group = Run)) +
+      geom_line() +
+      labs(title = paste("Experimental Design (optimal) trajectories, colored by",
+                         c("titer", "main", "acid", "cger")[i], "observed"),
+           x = "Hour", y = c("titer", "main", "acid", "cger")[i]) +
+      scale_color_viridis_c(direction = -1) +
+      theme_bw()
+  })
+```
+
+
+
+
+
+
+```{r}
+###
+### PROJECT FOR ANOTHER DAY...
+###
+
+# entry 1: first derivative of objective function WRT x1
+# ...
+# entry n: first derivative of objective function WRT xn
+
+
+### calculate gradients of arbitrary objective functions =======================
+#...focus only on min/max elements?
+
+terms_base = "x" 
+terms_suffix = "_cd" 
+quad_suffix = "_sq" ### IDEA: use 'pwr2' as the default and then access the '2'...allows extensibility to higher powers (similarly, would need to loop through iterations to access >2-factor interactions...)
+
+max_fxn <- coefficients(cd_lm_lst$titer)
+names(max_fxn) <- sub(terms_suffix, "", names(max_fxn))
+
+terms_ <- names(max_fxn)
+quad_idx <- grepl(quad_suffix, terms_)
+intrct_idx <- grepl("_", terms_) & !quad_idx
+
+
+base_terms <- terms_[!(terms_ %in% c("(Intercept)", terms_[intrct_idx | quad_idx]))]
+
+lapply(seq_along(base_terms), function(i) {
+  trm <- base_terms[i]
+  inter <- grep(trm, terms_[intrct_idx], value = TRUE) # name of interaction to source
+  # identify other component of interaction
+  inter_ <- gsub(paste0(trm, "|_"), "", inter) # 'other' term in the interaction
+  
+  quad <- grep(trm, terms_[quad_idx])
+  
+  if (length(quad) > 0){quad_ <- max_fxn[[quad]]}
+  
+  
+  #c(max_fxn[[trm]], 2 * quad_,  
+  list(inter, inter_, quad_)
+})
+
+
+id_components <- function(named_coeffs, terms_base, terms_suffix, quad_suffix) {
+  trms <- names(named_coeffs)
+  quad_idx <- grepl(quad_suffix, trms)
+  intrct_idx <- grepl("_", trms) & !quad_idx
+  base_trms <- trms[!(trms %in% c("(Intercept)", trms[intrct_idx | quad_idx]))]
+  
+  ###
+  ### END TARGET: vector of values to sum for each base term ( = 'x' entry...)
+  ### FOR PER ENTRY: [const] + [scalar] * x
+  
+  lapply(seq_along(base_trms), function(i) {
+    trm <- base_trms[i]
+    # identify sets of interactions
+    intr <- grep(trm, trms[intrct_idx], value = TRUE) # name of interaction to source
+    intr_ <- gsub(paste0(trm, "|_"), "", intr) # 'other' term in the interaction
+    
+    ###
+    ### TODO: create pairs of 
+    ###
+    
+    # identify quadratic term (if present)
+    quad <- grep(trm, trms[quad_idx])
+    if (length(quad) > 0){quad_ <- max_fxn[[quad]]}
+    
+  })
+}
+```
+
+
